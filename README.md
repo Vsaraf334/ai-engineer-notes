@@ -12,6 +12,7 @@ Theory and revision notes from a 16-week plan to move from Java backend developm
 | 6 | [Evaluating RAG: evals and LLM judges](week-06-evals-llm-judge.md) | rag-docs |
 | 7 | [Postgres, pgvector and hybrid search](week-07-pgvector-hybrid-search.md) | rag-docs |
 | 8 | [Agents and tool use](week-08-agents-tool-use.md) | rag-docs (agent mode) |
+| 9 | [MCP: the Model Context Protocol](week-09-mcp.md) | rag-docs (MCP server + host) |
 
 ## How each document is organised
 
