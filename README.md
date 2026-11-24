@@ -15,6 +15,10 @@ Theory and revision notes from a 16-week plan to move from Java backend developm
 | 9 | [MCP: the Model Context Protocol](week-09-mcp.md) | rag-docs (MCP server + host) |
 | 10 | [Agent evals, human approval, how agents fail, and LangGraph](week-10-agent-evals-approval.md) | [incident-agent](https://github.com/Vsaraf334/incident-agent) |
 
+## Interview preparation
+
+About 100 interview questions with answers built from these projects: [interview/](interview/README.md).
+
 ## How each document is organised
 
 1. **Concepts:** the theory, explained from first principles, with Java comparisons.
