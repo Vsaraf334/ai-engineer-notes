@@ -1,10 +1,10 @@
-# Week 10: Agent evals, human approval and how agents fail
+# Week 10: Agent evals, human approval, how agents fail, and LangGraph
 
 In weeks 8 and 9 the agent had one tool, and it only read: search the docs. This week's agent has **three tools, and one of them writes**: it files incident reports that would page people. That changes three things. Claude must **choose** between tools, a **human** must approve the write, and you need **evals that grade the path an agent took**, not only its final answer. Along the way the agent failed in several distinct ways, and each failure needed its own defence.
 
-**Built in:** [incident-agent](https://github.com/Vsaraf334/incident-agent): an on-call assistant that investigates an alert with `get_recent_deploys`, `search_logs` and `file_incident`, over fake data for 11 services.
+**Built in:** [incident-agent](https://github.com/Vsaraf334/incident-agent): an on-call assistant that investigates an alert with `get_recent_deploys`, `search_logs` and `file_incident`, over fake data for 11 services. Then the same agent rebuilt with **LangGraph** (`src/graph_agent.py`) and compared on the same eval.
 
-**Versions used:** `anthropic` Python SDK **2.12** (rag-docs uses 1.15; the Messages API calls are the same). Agent: Claude **Sonnet 5.5** (Haiku 5.5 measured). Judge: Sonnet 5.5.
+**Versions used:** `anthropic` Python SDK **2.12** (rag-docs uses 1.15; the Messages API calls are the same). Agent: Claude **Sonnet 5.5** (Haiku 5.5 measured). Judge: Sonnet 5.5. **LangGraph 1.2**, `langchain-anthropic` 1.7 (many tutorials show 0.x APIs).
 
 ---
 
@@ -131,6 +131,25 @@ Why the judge for the cause: wording varies ("timeout cut to 2s" vs "2000ms limi
 - **Consistency is a quality:** Sonnet gave the same severity in every run of each scenario; Haiku varied in 4 of 11.
 - **Predictions are cheap, measurements aren't.** Before the first eval I predicted the injection, baseline-noise and older-deploy scenarios would fail. All three passed; the failures were elsewhere.
 
+### 1.9 LangGraph: the loop as a graph
+
+LangGraph runs an agent as a **graph**: you write each step as a small function and declare the arrows between them, and LangGraph does the looping. Java analogy: a workflow engine (Camunda, Spring State Machine).
+
+| Your loop | LangGraph |
+| --- | --- |
+| local variables (`messages`, `run`) | **State**: a `TypedDict` every node reads |
+| the two halves of the loop body | **nodes**: `state -> update`, returning only what changed |
+| `messages.append(...)` | a **reducer** on the field: `Annotated[list, add_messages]` appends; no reducer = overwrite |
+| `if stop_reason == "end_turn": return` | a **conditional edge**: a function that returns the next node's name, or `END` |
+| the `for` loop | the edges, e.g. `tools -> agent` |
+| `MAX_STEPS` | `recursion_limit` (counts **node runs**, not API calls) |
+
+**Human approval with `interrupt()`.** Inside a node, `answer = interrupt(proposal)` stops the whole graph and hands `proposal` to the caller. A **checkpointer** has saved the state under a `thread_id`; the caller continues with `graph.stream(Command(resume=answer), config)`. Unlike `input()`, nothing is blocked while waiting, and with a database checkpointer the resume can come hours later from another process. Java analogy: a user task in Camunda or Temporal.
+
+**The trap: a resumed node runs again from its first line.** Each finished `interrupt()` returns its saved answer instead of pausing (measured: a node with 2 questions started 3 times). Anything with side effects before an `interrupt()` in the same node runs again on every resume. So: a node that asks has no side effects; the writes happen in a later node.
+
+**Same behaviour, different plumbing.** With the same model, prompt, schemas and tools, the graph scored the same as the loop (45/45 runs, 15/15 scenarios). LangGraph changes who drives the loop, not what Claude sees.
+
 ---
 
 ## 2. How we built it
@@ -230,6 +249,42 @@ A scenario:
 
 ---
 
+### 2.6 The LangGraph rebuild (`src/graph_agent.py`)
+
+```
+START ─► agent ──(tool calls?)──yes─► approve ─► tools ─┐
+           ▲      │                                       │
+           │      no ─► END                               │
+           └──────────────────────────────────────────────┘
+```
+
+```python
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]   # appended
+    calls: Annotated[list[ToolCall], operator.add]          # old + new
+    decisions: dict[str, dict]                              # replaced: approve -> tools
+    rejections: int
+    failed_writes: int
+```
+
+- **`agent_node`:** `make_llm().invoke([SystemMessage(SYSTEM_PROMPT), *state["messages"]])`, the stop-reason guard, `return {"messages": [response]}`. `make_llm()` is `ChatAnthropic(...).bind_tools(TOOLS)`: the same strict schemas, passed through unchanged.
+- **`route`:** `"approve"` if the last message is an `AIMessage` with `tool_calls`, else `END`.
+- **`approve_node`:** for each `file_incident`: the caps first, then `answer = interrupt(call)`, and a decision per `tool_call_id`. No side effects.
+- **`tools_node`:** your `run_tool` logic per call (`FUNCTIONS[call["name"]](**call["args"])`, `except Exception`), returning `ToolMessage(..., status="error")` for failures and for rejected writes, which never run.
+- **`build_graph`:** `add_node`, `add_edge(START, "agent")`, `add_conditional_edges("agent", route, ["approve", END])`, `add_edge("approve", "tools")`, `add_edge("tools", "agent")`, then `compile(checkpointer=InMemorySaver(serde=...))`.
+- **`run_graph`:** a `while` loop around `graph.stream(...)`. Each pass runs until the graph reaches `END` or pauses (an update named `"__interrupt__"`); on a pause it asks the approver and resumes with `Command(resume=...)`. It returns the same `AgentRun` as `run_agent`, so the eval's `--impl graph` needed only a registry entry.
+
+| Anthropic API (the loop) | LangChain / LangGraph |
+| --- | --- |
+| `tool_use` blocks: `b.name`, `b.input`, `b.id` | `AIMessage.tool_calls`: `call["name"]`, `call["args"]`, `call["id"]` |
+| `{"type": "tool_result", "is_error": True}` | `ToolMessage(..., status="error")` |
+| `response.stop_reason` | `response.response_metadata["stop_reason"]` |
+| `response.usage.input_tokens` | `response.usage_metadata["input_tokens"]` |
+
+**Tests without the API:** a `FakeClaude` whose `invoke()` returns scripted `AIMessage`s is patched in for `make_llm`, so the real graph (interrupt, checkpointer, resume) runs with stub approvers. One test proves two approved incidents in one reply are each filed exactly once.
+
+**What the framework gave:** pausable approval (`interrupt` + checkpointer), an explicit structure, per-step streaming. **What it cost or hid:** a second message format and conversions, re-execution on resume, a serialization allow-list, `recursion_limit` counting nodes, type friction, three more dependencies. Verdict: the hand-written loop is simpler for an agent that answers in one go; LangGraph earns its place when runs must pause and resume, or the flow grows into many branches.
+
 ## 3. Key points
 
 - **Tool returns are prompts; tool errors should teach; validate before side effects.**
@@ -247,6 +302,12 @@ A scenario:
 - **When comparing models, look at which columns differ**, and whether the judge could be biased toward one.
 - **Tokens aren't cost:** multiply by price; compare per correct outcome.
 - **A failed run should keep its trace** (`AgentError(message, run)`), or failures become guesses.
+
+- **LangGraph = state + nodes + edges;** reducers decide how a node's update merges into the state.
+- **`interrupt()` pauses the graph; a checkpointer + `thread_id` lets `Command(resume=...)` continue it.**
+- **A resumed node re-runs from the top:** keep side effects out of the node that asks.
+- **Same model and prompt, same behaviour:** a framework changes the plumbing, not the decisions. Measure it with the same eval.
+- **Keep one contract** (`run_agent` and `run_graph` both return an `AgentRun`) so tools like the eval work with either implementation.
 
 ## 4. Gotchas we hit
 
@@ -266,6 +327,12 @@ A scenario:
 14. **`gh: mkdir ~/.config/gh: permission denied`:** `~/.config` was owned by root (created by an installer run with sudo). Fix: `sudo chown -R $USER:staff ~/.config`. Also: `git init` made a `master` branch; set `git config --global init.defaultBranch main`.
 15. **Predictions were wrong.** Mine about which scenarios would fail, and a severity count I quoted before checking the data. Measure first, then claim.
 
+16. **`agent_node` raised `AgentError(..., run)`: `NameError`.** A node only sees `state`; there is no `run` inside it. Raise `RuntimeError`, and let `run_graph` wrap it with the trace.
+17. **`for tool in AIMessage.tool_calls`:** `AIMessage` is the class; the tool calls belong to one object, `state["messages"][-1]` (like `Order.getItems()` vs `order.getItems()`).
+18. **Pylance: `Cannot access attribute "tool_calls" for class "HumanMessage"`.** `state["messages"]` holds any message type; narrow with `isinstance(last, AIMessage)` (or `assert` when anything else would be a bug). Also: `bind_tools` returns a `Runnable`, not a `ChatAnthropic`; tool-call ids are `str | None`.
+19. **`Deserializing unregistered type agent.ToolCall from checkpoint. This will be blocked in a future version.`** The checkpointer restores only allow-listed types: `InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=[("agent", "ToolCall")]))`.
+20. **The first walkthrough was too much at once** (LangChain types, streaming, the graph). A 50-line demo with a scripted fake "Claude" and plain prints showed the graph idea first.
+
 ## 5. Revision questions
 
 1. Give the three rules for designing a tool's output and errors for an LLM, with an example of each.
@@ -284,6 +351,11 @@ A scenario:
 14. Sonnet beat Haiku 45/45 to 37/45, with a Sonnet judge. Why is the comparison still trustworthy, and what does "cause correct 45/45 for both" tell you?
 15. Sonnet used 32% fewer tokens. Is it cheaper? What would you compute to decide?
 
+16. Map your hand-written loop onto LangGraph: what are the state, the nodes, the reducer and the conditional edge?
+17. What does `interrupt()` do, what does it need in order to work, and how does the caller continue the run?
+18. Why must the node that calls `interrupt()` have no side effects? What would go wrong otherwise?
+19. The loop and the graph scored the same on the eval. Why is that expected, and what did the framework actually give you?
+
 ## Answers
 
 1. (a) **The return is the prompt:** return compact text such as one log line per line, not a raw JSON dump. (b) **Errors teach recovery:** `Unknown service 'checkout'. Known services: ...` lets Claude retry with the right name. (c) **Validate before side effects:** `file_incident` checks severity and contents before writing, so a rejected call leaves nothing behind.
@@ -301,3 +373,7 @@ A scenario:
 13. Agents vary between runs in both path and decision, so one run is a sample. A scenario passes on a majority (2 of 3). Two evals of identical code gave 42/45 and 37/45 runs, so differences of that size are noise.
 14. Sonnet's advantage was in the decision column and the failed-call count, both graded by code, not the judge. "Cause correct 45/45 for both" means Haiku investigated as well as Sonnet; its failures were tool-call formatting (7 of 8 failed runs hit the failed-write cap with the right cause).
 15. Not necessarily: Sonnet costs more per token. Compute (input tokens × input price + output tokens × output price) per run for each model, and ideally the cost per *correct* outcome, since Haiku's failed runs still cost money.
+16. **State:** a `TypedDict` with `messages`, `calls` and the approval counters (the loop's local variables). **Nodes:** `agent_node` (call Claude once) and `tools_node` (run the calls), the two halves of the loop body, plus `approve_node`. **Reducer:** `add_messages` appends a node's new messages, like `messages.append`. **Conditional edge:** `route` returns `"approve"` if Claude asked for tools, else `END`, like the `end_turn` check. The edges replace the `for` loop.
+17. It stops the graph and hands its argument (the proposed tool call) to the caller. It needs a **checkpointer** (which saves the state) and a **`thread_id`** in the config (which run to save and resume). The caller continues with `graph.stream(Command(resume=answer), config)`; the paused node runs again and `interrupt()` returns `answer`.
+18. On resume, the node runs again from its first line. Code before the `interrupt()` runs again on every resume, so a write there would happen twice (or more). The approve node only decides; the tools node, which runs once after all the answers, does the writes.
+19. The model, system prompt, tool schemas, tools and approval rules were identical; LangGraph only changes who drives the loop, so the decisions shouldn't change (the small token difference was within the measured noise). It gave approval that can pause and resume later (with a database checkpointer, even in another process), an explicit structure, and per-step streaming, at the cost of a second message format, re-execution on resume, serialization rules and more dependencies.

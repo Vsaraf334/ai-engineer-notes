@@ -13,7 +13,7 @@ Theory and revision notes from a 16-week plan to move from Java backend developm
 | 7 | [Postgres, pgvector and hybrid search](week-07-pgvector-hybrid-search.md) | rag-docs |
 | 8 | [Agents and tool use](week-08-agents-tool-use.md) | rag-docs (agent mode) |
 | 9 | [MCP: the Model Context Protocol](week-09-mcp.md) | rag-docs (MCP server + host) |
-| 10 | [Agent evals, human approval and how agents fail](week-10-agent-evals-approval.md) | [incident-agent](https://github.com/Vsaraf334/incident-agent) |
+| 10 | [Agent evals, human approval, how agents fail, and LangGraph](week-10-agent-evals-approval.md) | [incident-agent](https://github.com/Vsaraf334/incident-agent) |
 
 ## How each document is organised
 
