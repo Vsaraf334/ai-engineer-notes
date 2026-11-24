@@ -150,6 +150,22 @@ LangGraph runs an agent as a **graph**: you write each step as a small function 
 
 **Same behaviour, different plumbing.** With the same model, prompt, schemas and tools, the graph scored the same as the loop (45/45 runs, 15/15 scenarios). LangGraph changes who drives the loop, not what Claude sees.
 
+### 1.10 A write tool over MCP: approval when the host owns the loop
+
+Over MCP, the **host** (e.g. Claude Code) runs the agent loop, so your own approval step (`handle_call`, `approve_node`) doesn't exist. A server can only **enforce** what happens in its own code; everything else it can only **request**:
+
+| Layer | Enforced by | Any host? |
+| --- | --- | --- |
+| content checks in the tool | the server's code | yes |
+| `meta={"anthropic/requiresUserInteraction": True}` | Claude Code | no |
+| annotations, `instructions` | hints | as the host chooses |
+
+Claude Code documents that a tool with `requiresUserInteraction` is prompted **on every call**: in auto and bypass modes too, allow rules don't skip it, there's no "don't ask again", and with nobody to answer the call is denied (fail-closed). Checked in practice: only Yes/No was offered; an explicit allow rule still asked; "No" interrupted the turn and nothing was filed.
+
+- **Annotations aren't permissions:** `read_only_hint` only lets Claude Code run calls in parallel. In MCP, "destructive" means deleting or overwriting, so a tool that only adds a record is `destructive_hint=False`; `idempotent_hint=False` is the one that says "twice means two".
+- **Elicitation** (`await ctx.elicit(message, Schema)`) is the portable alternative: the server asks the user during the call, through any host that supports it. But the host still decides how to answer (a hook can answer automatically), and the server must fail closed itself when it can't ask.
+- **Rejection, two designs:** your agent sends Claude an `is_error` result and Claude finishes its report; Claude Code interrupts the turn and asks the person what to do instead.
+
 ---
 
 ## 2. How we built it
@@ -309,6 +325,8 @@ class State(TypedDict):
 - **Same model and prompt, same behaviour:** a framework changes the plumbing, not the decisions. Measure it with the same eval.
 - **Keep one contract** (`run_agent` and `run_graph` both return an `AgentRun`) so tools like the eval work with either implementation.
 
+- **Over MCP, the host owns approval.** A server enforces only its own code; `requiresUserInteraction` makes Claude Code ask every time; elicitation is the portable option.
+
 ## 4. Gotchas we hit
 
 1. **`Unexpected stop_reason: max_tokens`** at the step that files the incident. `max_tokens=1024` capped *one response*, and the incident's quoted evidence was longer. A higher cap costs nothing extra (you pay for tokens generated). The guard that raised was right: a cut-off response can end mid-`tool_use`.
@@ -333,6 +351,8 @@ class State(TypedDict):
 19. **`Deserializing unregistered type agent.ToolCall from checkpoint. This will be blocked in a future version.`** The checkpointer restores only allow-listed types: `InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=[("agent", "ToolCall")]))`.
 20. **The first walkthrough was too much at once** (LangChain types, streaming, the graph). A 50-line demo with a scripted fake "Claude" and plain prints showed the graph idea first.
 
+21. **I planned `destructive_hint=True` for `file_incident`.** In MCP, destructive means deleting or overwriting data; filing only adds a record. `idempotent_hint=False` is the accurate warning.
+
 ## 5. Revision questions
 
 1. Give the three rules for designing a tool's output and errors for an LLM, with an example of each.
@@ -356,6 +376,8 @@ class State(TypedDict):
 18. Why must the node that calls `interrupt()` have no side effects? What would go wrong otherwise?
 19. The loop and the graph scored the same on the eval. Why is that expected, and what did the framework actually give you?
 
+20. Your `file_incident` is exposed over MCP and Claude Code is the host. What can your server enforce, what can it only request, and how did you make Claude Code ask before every filing?
+
 ## Answers
 
 1. (a) **The return is the prompt:** return compact text such as one log line per line, not a raw JSON dump. (b) **Errors teach recovery:** `Unknown service 'checkout'. Known services: ...` lets Claude retry with the right name. (c) **Validate before side effects:** `file_incident` checks severity and contents before writing, so a rejected call leaves nothing behind.
@@ -377,3 +399,4 @@ class State(TypedDict):
 17. It stops the graph and hands its argument (the proposed tool call) to the caller. It needs a **checkpointer** (which saves the state) and a **`thread_id`** in the config (which run to save and resume). The caller continues with `graph.stream(Command(resume=answer), config)`; the paused node runs again and `interrupt()` returns `answer`.
 18. On resume, the node runs again from its first line. Code before the `interrupt()` runs again on every resume, so a write there would happen twice (or more). The approve node only decides; the tools node, which runs once after all the answers, does the writes.
 19. The model, system prompt, tool schemas, tools and approval rules were identical; LangGraph only changes who drives the loop, so the decisions shouldn't change (the small token difference was within the measured noise). It gave approval that can pause and resume later (with a database checkpointer, even in another process), an explicit structure, and per-step streaming, at the cost of a second message format, re-execution on resume, serialization rules and more dependencies.
+20. It can enforce only its own code: the content checks in `file_incident` run on every call, whatever the host. It can request through hints (annotations, `instructions`), which the host may ignore. For Claude Code, `meta={"anthropic/requiresUserInteraction": True}` on the tool makes it prompt on every call, even with an allow rule or in bypass mode, with no "don't ask again", and denies the call if nobody can answer. Other hosts ignore that flag; elicitation is the portable way for a server to ask the user, but it must fail closed itself.
